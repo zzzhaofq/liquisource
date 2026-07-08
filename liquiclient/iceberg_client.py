@@ -82,56 +82,16 @@ def _build_storage_config(prefix):
     return config
 
 
-# 获取iceberg catalog实例
-def get_iceberg_client():
-    catalog_name = get_property("iceberg.catalog.name")
-    catalog_type = get_property("iceberg.catalog.type")
-    catalog_uri = get_property("iceberg.catalog.uri")
-    warehouse = get_property("iceberg.catalog.warehouse")
+def _collect_rest_catalog_config(prefix):
+    """
+    收集 REST Catalog 专有配置（认证 + Credential Vending header）
 
-    config = {
-        "type": catalog_type,
-        "uri": catalog_uri,
-        "warehouse": warehouse,
-    }
-
-    # REST Catalog 认证配置
-    credential = get_property_or_none("iceberg.catalog.credential")
-    if credential:
-        config["credential"] = credential
-    token = get_property_or_none("iceberg.catalog.token")
-    if token:
-        config["token"] = token
-    scope = get_property_or_none("iceberg.catalog.scope")
-    if scope:
-        config["scope"] = scope
-
-    # 禁用 Credential Vending（pyiceberg 默认请求 vended-credentials，
-    # 若 Polaris 服务端未配置存储凭证会报错，DDL 操作不需要此功能）
-    config["header.X-Iceberg-Access-Delegation"] = ""
-
-    # 根据存储类型构建配置
-    storage_config = _build_storage_config("iceberg")
-    config.update(storage_config)
-
-    return load_catalog(catalog_name, **config)
-
-
-# 获取iceberg集群catalog实例
-def get_iceberg_cluster_client(cluster):
-    prefix = cluster + ".iceberg"
-    catalog_name = get_property(prefix + ".catalog.name")
-    catalog_type = get_property(prefix + ".catalog.type")
-    catalog_uri = get_property(prefix + ".catalog.uri")
-    warehouse = get_property(prefix + ".catalog.warehouse")
-
-    config = {
-        "type": catalog_type,
-        "uri": catalog_uri,
-        "warehouse": warehouse,
-    }
-
-    # REST Catalog 认证配置
+    读取以下配置项（均为可选）:
+      - {prefix}.catalog.credential : OAuth2 客户端凭证
+      - {prefix}.catalog.token      : Bearer Token
+      - {prefix}.catalog.scope      : OAuth2 scope
+    """
+    config = {}
     credential = get_property_or_none(prefix + ".catalog.credential")
     if credential:
         config["credential"] = credential
@@ -142,13 +102,110 @@ def get_iceberg_cluster_client(cluster):
     if scope:
         config["scope"] = scope
 
-    # 禁用 Credential Vending
+    # 禁用 Credential Vending（pyiceberg 默认请求 vended-credentials，
+    # 若 Polaris 服务端未配置存储凭证会报错，DDL 操作不需要此功能）
     config["header.X-Iceberg-Access-Delegation"] = ""
+    return config
 
-    # 根据存储类型构建配置
-    storage_config = _build_storage_config(prefix)
-    config.update(storage_config)
 
+def _collect_jdbc_catalog_config(prefix):
+    """
+    收集 JDBC Catalog 专有配置
+
+    读取以下配置项（均为可选）:
+      - {prefix}.catalog.jdbc.user       : 数据库用户名
+      - {prefix}.catalog.jdbc.password   : 数据库密码
+      - {prefix}.catalog.jdbc.*          : 其他常见 JDBC 参数（如 useSSL、schema-version 等）
+
+    返回:
+        dict，key 形如 "jdbc.user" / "jdbc.password" / "jdbc.xxx"
+    """
+    jdbc_config = {}
+    user = get_property_or_none(prefix + ".catalog.jdbc.user")
+    if user is not None:
+        jdbc_config["jdbc.user"] = user
+    password = get_property_or_none(prefix + ".catalog.jdbc.password")
+    if password is not None:
+        jdbc_config["jdbc.password"] = password
+
+    # schema-version：Iceberg JDBC Catalog 元数据表结构版本，默认 V1
+    schema_version = get_property_or_none(prefix + ".catalog.jdbc.schema-version")
+    jdbc_config["jdbc.schema-version"] = schema_version if schema_version else "V1"
+
+    # 禁用 catalog 缓存：JDBC Catalog 元数据存储于外部数据库，
+    # 开启缓存可能导致读到过期表结构（其他进程 DDL 后本进程感知不到）
+    cache_enabled = get_property_or_none(prefix + ".catalog.cache-enabled")
+    jdbc_config["cache-enabled"] = cache_enabled if cache_enabled else "false"
+
+    # 常见扩展 JDBC 参数（预留常用键，get_property 无法枚举全部前缀）
+    for extra_key in ("useSSL", "verifyServerCertificate",
+                      "serverTimezone", "characterEncoding", "connectionTimeout"):
+        val = get_property_or_none(prefix + ".catalog.jdbc." + extra_key)
+        if val is not None:
+            jdbc_config["jdbc." + extra_key] = val
+
+    return jdbc_config
+
+
+def _build_catalog_config(prefix, for_pyiceberg=False):
+    """
+    构建 Iceberg Catalog 配置（按 catalog_type 分支加载对应字段，互斥）
+
+    参数:
+        prefix: 配置项前缀，默认 catalog 为 "iceberg"，集群 catalog 为 "{cluster}.iceberg"
+        for_pyiceberg: 是否用于 pyiceberg 客户端
+            - True : 供 pyiceberg 使用，会做 type/字段名兼容映射（jdbc→sql, jdbc.user→user）
+            - False: 供 Spark 使用，保留 Spark Iceberg 原生字段名
+
+    返回:
+        (catalog_name, config_dict)
+    """
+    catalog_name = get_property(prefix + ".catalog.name")
+    catalog_type = get_property(prefix + ".catalog.type").strip().lower()
+    catalog_uri = get_property(prefix + ".catalog.uri")
+    warehouse = get_property(prefix + ".catalog.warehouse")
+
+    config = {
+        "type": catalog_type,
+        "uri": catalog_uri,
+        "warehouse": warehouse,
+    }
+
+    # 按 catalog 类型分支加载专有配置（REST / JDBC 互斥）
+    if catalog_type == "rest":
+        config.update(_collect_rest_catalog_config(prefix))
+    elif catalog_type == "jdbc":
+        config.update(_collect_jdbc_catalog_config(prefix))
+        if for_pyiceberg:
+            # pyiceberg 使用 SqlCatalog（type=sql），字段名也不同，需做兼容映射
+            config["type"] = "sql"
+            if "jdbc.user" in config:
+                config["user"] = config.pop("jdbc.user")
+            if "jdbc.password" in config:
+                config["password"] = config.pop("jdbc.password")
+            # pyiceberg SqlCatalog 不识别以下 Spark 专有字段，需剔除
+            config.pop("cache-enabled", None)
+            config.pop("jdbc.schema-version", None)
+    else:
+        raise ValueError(
+            f"不支持的 catalog 类型: {catalog_type}，当前支持: rest / jdbc"
+        )
+
+    # 存储配置（S3 / MinIO / COS / OSS），与 catalog_type 无关，两种类型都需要
+    config.update(_build_storage_config(prefix))
+
+    return catalog_name, config
+
+
+# 获取iceberg catalog实例
+def get_iceberg_client():
+    catalog_name, config = _build_catalog_config("iceberg", for_pyiceberg=True)
+    return load_catalog(catalog_name, **config)
+
+
+# 获取iceberg集群catalog实例
+def get_iceberg_cluster_client(cluster):
+    catalog_name, config = _build_catalog_config(cluster + ".iceberg", for_pyiceberg=True)
     return load_catalog(catalog_name, **config)
 
 
@@ -162,41 +219,8 @@ def _get_catalog_config(cluster=None):
     返回:
         (catalog_name, config_dict) 元组
     """
-    if cluster:
-        prefix = cluster + ".iceberg"
-    else:
-        prefix = "iceberg"
-
-    catalog_name = get_property(prefix + ".catalog.name")
-    catalog_type = get_property(prefix + ".catalog.type")
-    catalog_uri = get_property(prefix + ".catalog.uri")
-    warehouse = get_property(prefix + ".catalog.warehouse")
-
-    config = {
-        "type": catalog_type,
-        "uri": catalog_uri,
-        "warehouse": warehouse,
-    }
-
-    # REST Catalog 认证配置
-    credential = get_property_or_none(prefix + ".catalog.credential")
-    if credential:
-        config["credential"] = credential
-    token = get_property_or_none(prefix + ".catalog.token")
-    if token:
-        config["token"] = token
-    scope = get_property_or_none(prefix + ".catalog.scope")
-    if scope:
-        config["scope"] = scope
-
-    # 禁用 Credential Vending
-    config["header.X-Iceberg-Access-Delegation"] = ""
-
-    # 根据存储类型构建配置
-    storage_config = _build_storage_config(prefix)
-    config.update(storage_config)
-
-    return catalog_name, config
+    prefix = cluster + ".iceberg" if cluster else "iceberg"
+    return _build_catalog_config(prefix, for_pyiceberg=False)
 
 
 # ============================================================
@@ -224,7 +248,7 @@ def _build_spark_session(catalog_name, catalog_config):
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions") \
         .config(f"spark.sql.catalog.{catalog_name}", "org.apache.iceberg.spark.SparkCatalog")
 
-    # 设置 catalog 类型
+    # 设置 catalog 类型（REST / JDBC，互斥）
     catalog_type = catalog_config.get("type", "rest")
     builder = builder.config(f"spark.sql.catalog.{catalog_name}.type", catalog_type)
 
@@ -238,28 +262,50 @@ def _build_spark_session(catalog_name, catalog_config):
     if warehouse:
         builder = builder.config(f"spark.sql.catalog.{catalog_name}.warehouse", warehouse)
 
-    # REST Catalog 认证配置
-    credential = catalog_config.get("credential")
-    if credential:
-        builder = builder.config(f"spark.sql.catalog.{catalog_name}.credential", credential)
+    # 按 catalog 类型分支加载专有配置（REST / JDBC 互斥）
+    if catalog_type == "rest":
+        # REST Catalog 认证配置
+        credential = catalog_config.get("credential")
+        if credential:
+            builder = builder.config(f"spark.sql.catalog.{catalog_name}.credential", credential)
 
-    token = catalog_config.get("token")
-    if token:
-        builder = builder.config(f"spark.sql.catalog.{catalog_name}.token", token)
+        token = catalog_config.get("token")
+        if token:
+            builder = builder.config(f"spark.sql.catalog.{catalog_name}.token", token)
 
-    scope = catalog_config.get("scope")
-    if scope:
-        builder = builder.config(f"spark.sql.catalog.{catalog_name}.scope", scope)
+        scope = catalog_config.get("scope")
+        if scope:
+            builder = builder.config(f"spark.sql.catalog.{catalog_name}.scope", scope)
 
-    # header 配置（如禁用 Credential Vending）
-    for key, value in catalog_config.items():
-        if key.startswith("header."):
-            builder = builder.config(f"spark.sql.catalog.{catalog_name}.{key}", value)
+        # header 配置（如禁用 Credential Vending，仅 REST Catalog 有意义）
+        for key, value in catalog_config.items():
+            if key.startswith("header."):
+                builder = builder.config(f"spark.sql.catalog.{catalog_name}.{key}", value)
 
-    # S3 / 存储相关配置
+    elif catalog_type == "jdbc":
+        # JDBC Catalog 配置（jdbc.user / jdbc.password / jdbc.*）
+        for key, value in catalog_config.items():
+            if key.startswith("jdbc."):
+                builder = builder.config(f"spark.sql.catalog.{catalog_name}.{key}", value)
+
+        # cache-enabled：JDBC Catalog 场景强烈建议禁用元数据缓存，
+        # 避免读取到其他进程 DDL 后的过期表结构
+        cache_enabled = catalog_config.get("cache-enabled")
+        if cache_enabled is not None:
+            builder = builder.config(
+                f"spark.sql.catalog.{catalog_name}.cache-enabled", cache_enabled
+            )
+
+    # 存储相关配置（S3 / MinIO / COS / OSS），与 catalog_type 无关
     for key, value in catalog_config.items():
         if key.startswith("s3.") or key.startswith("fs."):
             builder = builder.config(f"spark.sql.catalog.{catalog_name}.{key}", value)
+
+    # Spark SQL 全局配置（Iceberg 场景通用，REST/JDBC 都需要）
+    #   - maxToStringFields: 打印宽表 schema 不被截断
+    #   - caseSensitive:     Iceberg 表列名大小写敏感，与 Spark 默认行为对齐
+    builder = builder.config("spark.sql.debug.maxToStringFields", "300")
+    builder = builder.config("spark.sql.caseSensitive", "true")
 
     # 设置默认 catalog
     builder = builder.config("spark.sql.defaultCatalog", catalog_name)
